@@ -1,0 +1,9 @@
+libx11:
+  ubuntu: libx11-dev
+  debian: libx11-dev
+  fedora: libX11-devel
+  macports: xorg-libX11
+  osxbrew:
+    lion:
+      homebrew:
+        packages: |

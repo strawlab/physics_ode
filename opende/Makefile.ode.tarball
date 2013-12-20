@@ -1,0 +1,95 @@
+# change the next flag to 'no' if drawstuff is not to be built
+WITH_DRAWSTUFF = yes
+
+CFG_OPTIONS = --with-libccd=cyl-cyl --with-trimesh=opcode --enable-new-trimesh --enable-demos --enable-shared --with-arch=nocona --enable-release --enable-malloc --enable-ou --disable-asserts --with-pic --enable-double-precision
+
+UNAME := $(shell uname)
+
+ifeq ($(WITH_DRAWSTUFF), yes) 
+	ifeq ($(UNAME), Darwin)
+		CFG_OPTIONS += --with-drawstuff=OSX
+	else
+		CFG_OPTIONS += --with-drawstuff=X11
+	endif
+endif
+
+all: threadpool installed
+
+ROOT = $(shell rospack find opende)/opende
+
+FILENAME = opende-wg-branch-r1825.tar.gz
+TARBALL = build/$(FILENAME)
+TARBALL_URL = http://pr.willowgarage.com/downloads/$(FILENAME)
+#TARBALL_PATCH = patches/quickstep_tprow.patch
+INITIAL_DIR = build/opende-wg-branch-r1825
+SOURCE_DIR = build/opende
+UNPACK_CMD = tar xzf
+MD5SUM_FILE = $(FILENAME).md5sum
+include $(shell rospack find mk)/download_unpack_build.mk
+
+###############################################################################################################
+#                                            boost setup in ros                                               #
+###############################################################################################################
+BOOST_CFLAGS = $(shell rosboost-cfg --cflags)
+BOOST_LFLAGS = $(shell rosboost-cfg --lflags signals,thread)
+THREADPOOL_CFLAGS = -I$(shell rospack find opende)/threadpool
+
+###############################################################################################################
+#                                            gcc compiler flags                                               #
+###############################################################################################################
+GCC_DEBUG_CFLAGS = -DNDEBUG -O3
+#GCC_DEBUG_CFLAGS = -ggdb
+GCC_OPENMP_CFLAGS =
+#GCC_OPENMP_CFLAGS = -msse -fopenmp
+GCC_OPENMP_LFLAGS =
+#GCC_OPENMP_LFLAGS = -lgomp
+GCC_FLAGS     = CXXFLAGS='$(GCC_DEBUG_CFLAGS) $(GCC_OPENMP_CFLAGS) -fPIC -I$(ROOT)/include $(BOOST_CFLAGS) $(THREADPOOL_CFLAGS)' \
+                CFLAGS='$(GCC_DEBUG_CFLAGS) $(GCC_OPENMP_CFLAGS) -fPIC -I$(ROOT)/include -I$(ROOT)/usr/include $(BOOST_CFLAGS) $(THREADPOOL_CFLAGS)'
+# Darwin needs an extra -dylib arg to work around a bug in Apple's GL
+# installation
+# http://developer.apple.com/mac/library/qa/qa2007/qa1567.html
+ifeq ($(shell uname),Darwin)
+GCC_FLAGS     += \
+                LDFLAGS='-L$(ROOT)/lib $(BOOST_LFLAGS) $(GCC_OPENMP_LFLAGS) -dylib_file /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib:/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib'
+else
+GCC_FLAGS     += \
+                LDFLAGS='-L$(ROOT)/lib $(BOOST_LFLAGS) $(GCC_OPENMP_LFLAGS) -lX11'
+endif
+
+
+
+###############################################################################################################
+#                                            choose which compiler to use                                     #
+###############################################################################################################
+CONFIGURE_FLAGS = $(CFG_OPTIONS) $(GCC_FLAGS)
+
+
+###############################################################################################################
+#                                            compile                                                          #
+###############################################################################################################
+threadpool:
+	make -f Makefile.threadpool
+installed: threadpool wiped $(SOURCE_DIR)/unpacked
+	cd $(SOURCE_DIR) && sh ./autogen.sh
+	cd $(SOURCE_DIR) && ./configure --prefix=$(ROOT) $(CONFIGURE_FLAGS)
+	cd $(SOURCE_DIR) && make $(ROS_PARALLEL_JOBS)
+	cd $(SOURCE_DIR) && make install
+	@mkdir -p opende/lib/pkgconfig
+	@mkdir -p opende/include
+	@mkdir -p opende/bin
+	@echo "patch ode-config to pass -Wl,-rpath,-L{exec_prefix}/lib"
+	sed 's/echo  -L$${exec_prefix}\/lib -lode/echo  -Wl,-rpath,$${exec_prefix}\/lib -L$${exec_prefix}\/lib -lode/g' ${SOURCE_DIR}/ode-config > opende/bin/ode-config
+	@echo "patch ode.pc to pass -Wl,-rpath,-L{libdir}"
+	sed 's/Libs: -L$${libdir} -lode/Libs: -Wl,-rpath,$${libdir} -L$${libdir} -lode/g' ${SOURCE_DIR}/ode.pc > opende/lib/pkgconfig/ode.pc
+	touch installed
+
+clean:
+	-cd $(SOURCE_DIR) && make -f Makefile clean
+	rm -rf opende installed
+
+wipe: clean
+	rm -rf build
+
+wiped: Makefile.ode.tarball
+	make -f Makefile.ode.tarball wipe
+	touch wiped

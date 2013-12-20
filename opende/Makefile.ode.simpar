@@ -1,0 +1,98 @@
+# change the next flag to 'no' if drawstuff is not to be built
+WITH_DRAWSTUFF = yes
+
+CFG_OPTIONS = --with-libccd=cyl-cyl --with-trimesh=opcode --enable-new-trimesh --disable-demos --enable-shared --with-arch=nocona --enable-release --enable-malloc --enable-ou --with-pic --enable-double-precision --disable-asserts
+SVN_REVISION = -r 1730
+
+SVN_PATCH = patches/1730_robust.patch
+
+ifeq ($(WITH_DRAWSTUFF), yes)
+CFG_OPTIONS += --with-drawstuff=X11
+endif
+
+all: threadpool installed
+
+ROOT = $(shell rospack find opende)/opende
+
+SVN_DIR = opende-svn
+SVN_URL = https://opende.svn.sourceforge.net/svnroot/opende/trunk 
+include $(shell rospack find mk)/svn_checkout.mk
+
+###############################################################################################################
+#                                            boost setup in ros                                               #
+###############################################################################################################
+BOOST_CFLAGS = $(shell rosboost-cfg --cflags)
+BOOST_LFLAGS = $(shell rosboost-cfg --lflags signals,thread)
+THREADPOOL_CFLAGS = -I$(shell rospack find opende)/threadpool
+
+###############################################################################################################
+#                                            intel compiler flags                                             #
+###############################################################################################################
+#ipo breaks build, e.g.  ipo: warning #11043: unresolved dsPrint, change to ip
+INTEL_OPTIONS      = CC='/opt/intel/Compiler/11.1/046/bin/ia32/icc' CXX='/opt/intel/Compiler/11.1/046/bin/ia32/icpc' LD='/opt/intel/Compiler/11.1/046/bin/ia32/xild'
+INTEL_C_FLAGS      =  CXXFLAGS='-march=core2 -msse3 -ip  -no-prec-div         -parallel -O3 -fPIC -I$(ROOT)/include $(BOOST_CFLAGS) $(THREADPOOL_CFLAGS)' \
+                      CFLAGS='-march=core2 -msse3 -ip  -no-prec-div         -parallel -O3 -fPIC -I$(ROOT)/include -I$(ROOT)/usr/include $(BOOST_CFLAGS) $(THREADPOOL_CFLAGS)'
+INTEL_C_FLAGS_OMP  =  CXXFLAGS='-march=core2 -msse3 -ip  -no-prec-div -openmp -parallel -O3 -fPIC -I$(ROOT)/include $(BOOST_CFLAGS) $(THREADPOOL_CFLAGS)' \
+                      CFLAGS='-march=core2 -msse3 -ip  -no-prec-div -openmp -parallel -O3 -fPIC -I$(ROOT)/include -I$(ROOT)/usr/include $(BOOST_CFLAGS) $(THREADPOOL_CFLAGS)'
+INTEL_LD_FLAGS     =  LDFLAGS='-Wl,-rpath,/opt/intel/Compiler/11.1/046/lib/ia32 -L/opt/intel/Compiler/11.1/046/lib/ia32 -lguide -lcxaguard -limf -lsvml -lirc -pthread -lintlc -lX11'
+INTEL_LD_FLAGS_OMP =  LDFLAGS='-Wl,-rpath,/opt/intel/Compiler/11.1/046/lib/ia32 -L/opt/intel/Compiler/11.1/046/lib/ia32 -lguide -lcxaguard -limf -lsvml -lirc -pthread -lintlc -lompstub -liomp5 -lomp_db'
+
+INTEL_FLAGS     = $(INTEL_OPTIONS) $(INTEL_C_FLAGS) $(INTEL_LD_FLAGS)
+INTEL_FLAGS_OMP = $(INTEL_OPTIONS) $(INTEL_C_FLAGS_OMP) $(INTEL_LD_FLAGS_OMP)
+
+###############################################################################################################
+#                                            gcc compiler flags                                               #
+###############################################################################################################
+GCC_DEBUG_CFLAGS = -DNDEBUG -O3
+#GCC_DEBUG_CFLAGS = -ggdb
+GCC_OPENMP_CFLAGS =
+#GCC_OPENMP_CFLAGS = -msse -fopenmp
+GCC_OPENMP_LFLAGS =
+#GCC_OPENMP_LFLAGS = -lgomp
+GCC_FLAGS     = CXXFLAGS='$(GCC_DEBUG_CFLAGS) $(GCC_OPENMP_CFLAGS) -fPIC -I$(ROOT)/include $(BOOST_CFLAGS) $(THREADPOOL_CFLAGS)' \
+                CFLAGS='$(GCC_DEBUG_CFLAGS) $(GCC_OPENMP_CFLAGS) -fPIC -I$(ROOT)/include -I$(ROOT)/usr/include $(BOOST_CFLAGS) $(THREADPOOL_CFLAGS)'
+# Darwin needs an extra -dylib arg to work around a bug in Apple's GL
+# installation
+# http://developer.apple.com/mac/library/qa/qa2007/qa1567.html
+ifeq ($(shell uname),Darwin)
+GCC_FLAGS     += \
+                LDFLAGS='-L$(ROOT)/lib $(BOOST_LFLAGS) $(GCC_OPENMP_LFLAGS) -dylib_file /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib:/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib'
+else
+GCC_FLAGS     += \
+                LDFLAGS='-L$(ROOT)/lib $(BOOST_LFLAGS) $(GCC_OPENMP_LFLAGS) -lX11'
+endif
+
+
+
+###############################################################################################################
+#                                            choose which compiler to use                                     #
+###############################################################################################################
+#CONFIGURE_FLAGS = $(CFG_OPTIONS) $(INTEL_FLAGS)
+#CONFIGURE_FLAGS = $(CFG_OPTIONS) $(INTEL_FLAGS_OMP)
+CONFIGURE_FLAGS = $(CFG_OPTIONS) $(GCC_FLAGS)
+
+
+###############################################################################################################
+#                                            compile                                                          #
+###############################################################################################################
+threadpool:
+	make -f Makefile.threadpool
+installed: threadpool $(SVN_DIR) patched
+	cd $(SVN_DIR) && sh ./autogen.sh
+	cd $(SVN_DIR) && ./configure --prefix=$(ROOT) $(CONFIGURE_FLAGS)
+	cd $(SVN_DIR) && make $(ROS_PARALLEL_JOBS)
+	cd $(SVN_DIR) && make install
+	@echo "patch ode-config to pass -Wl,-rpath,-L{exec_prefix}/lib"
+	sed 's/echo  -L$${exec_prefix}\/lib -lode/echo  -Wl,-rpath,$${exec_prefix}\/lib -L$${exec_prefix}\/lib -lode/g' opende-svn/ode-config > opende/bin/ode-config
+	#sed 's/echo  -L$${exec_prefix}\/lib -lode/echo  -Wl,-rpath,$${exec_prefix}\/lib -L$${exec_prefix}\/lib -lode -Wl,-rpath,\/opt\/intel\/Compiler\/11.1\/046\/lib\/ia32 -L\/opt\/intel\/Compiler\/11.1\/046\/lib\/ia32 -lguide -lcxaguard -limf -lsvml -lirc -pthread/g' opende-svn/ode-config > opende/bin/ode-config
+	@echo "patch ode.pc to pass -Wl,-rpath,-L{libdir}"
+	sed 's/Libs: -L$${libdir} -lode/Libs: -Wl,-rpath,$${libdir} -L$${libdir} -lode/g' opende-svn/ode.pc > opende/lib/pkgconfig/ode.pc
+	#sed 's/Libs: -L$${libdir} -lode/Libs: -Wl,-rpath,$${libdir} -L$${libdir} -lode -Wl,-rpath,\/opt\/intel\/Compiler\/11.1\/046\/lib\/ia32 -L\/opt\/intel\/Compiler\/11.1\/046\/lib\/ia32 -lguide -lcxaguard -limf -lsvml -lirc -pthread/g' opende-svn/ode.pc > opende/lib/pkgconfig/ode.pc
+	touch installed
+
+clean:
+	-cd $(SVN_DIR) && make -f Makefile clean
+	rm -rf opende installed
+
+wipe: clean
+	rm -rf $(SVN_DIR)

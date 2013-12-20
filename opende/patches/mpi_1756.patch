@@ -1,0 +1,32 @@
+Index: ode/src/quickstep.cpp
+===================================================================
+--- ode/src/quickstep.cpp	(revision 1756)
++++ ode/src/quickstep.cpp	(working copy)
+@@ -1061,6 +1061,11 @@
+   dxWorld *world, dxBody * const *body, int nb,
+   dxJoint * const *_joint, int _nj, dReal stepsize)
+ {
++
++  //int mpi_rank = MPI::COMM_WORLD.Get_rank();
++  //int mpi_nprocs = MPI::COMM_WORLD.Get_size();
++  //printf("-------------\ndebug opende %d %d\n-------------\n",mpi_rank,mpi_nprocs);
++
+   IFTIMING(dTimerStart("preprocessing"));
+ 
+   const dReal stepsize1 = dRecip(stepsize);
+@@ -1529,6 +1534,7 @@
+ 
+     // load lambda from the value saved on the previous iteration
+     dReal *lambda = context->AllocateArray<dReal> (m);
++    dReal *lambda_qr = context->AllocateArray<dReal> (m);
+ 
+ #ifdef WARM_STARTING
+     {
+@@ -1843,6 +1849,7 @@
+         }
+ 
+         size_t sub2_res2 = dEFFICIENT_SIZE(sizeof(dReal) * m); // for lambda
++        sub2_res2 += dEFFICIENT_SIZE(sizeof(dReal) * m); // for lambda_qr
+         sub2_res2 += dEFFICIENT_SIZE(sizeof(dReal) * 6 * nb); // for cforce
+         {
+           size_t sub3_res1 = EstimateSOR_LCPMemoryRequirements(m

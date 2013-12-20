@@ -1,0 +1,628 @@
+Index: include/ode/misc.h
+===================================================================
+--- include/ode/misc.h	(revision 1730)
++++ include/ode/misc.h	(working copy)
+@@ -57,8 +57,11 @@
+ #ifdef __cplusplus
+ ODE_API void dPrintMatrix (const dReal *A, int n, int m, char *fmt = "%10.4f ",
+ 		   FILE *f=stdout);
++ODE_API void dPrintIntMatrix (const int *A, int n, int m, char *fmt = "%5d ",
++		   FILE *f=stdout);
+ #else
+ ODE_API void dPrintMatrix (const dReal *A, int n, int m, char *fmt, FILE *f);
++ODE_API void dPrintIntMatrix (const int *A, int n, int m, char *fmt, FILE *f);
+ #endif
+ 
+ /* make a random vector with entries between +/- range. A has n elements. */
+Index: ode/src/collision_space.cpp
+===================================================================
+--- ode/src/collision_space.cpp	(revision 1730)
++++ ode/src/collision_space.cpp	(working copy)
+@@ -168,7 +168,10 @@
+ 
+   // add
+   geom->parent_space = this;
+-  geom->spaceAdd (&first);
++  {
++    boost::mutex::scoped_lock lock(this->mutex);
++    geom->spaceAdd (&first);  // lock mutex before alterning linked list
++  }
+   count++;
+ 
+   // enumerator has been invalidated
+@@ -189,7 +192,10 @@
+   dUASSERT (geom->parent_space == this,"object is not in this space");
+ 
+   // remove
+-  geom->spaceRemove();
++  {
++    boost::mutex::scoped_lock lock(this->mutex);
++    geom->spaceRemove();  // lock mutex before alterning linked list
++  }
+   count--;
+ 
+   // safeguard
+@@ -208,6 +214,7 @@
+ 
+ void dxSpace::dirty (dxGeom *geom)
+ {
++  boost::mutex::scoped_lock lock(this->mutex);  // lock mutex before alterning linked list
+   geom->spaceRemove();
+   geom->spaceAdd (&first);
+ }
+Index: ode/src/quickstep.cpp
+===================================================================
+--- ode/src/quickstep.cpp	(revision 1730)
++++ ode/src/quickstep.cpp	(working copy)
+@@ -589,7 +589,7 @@
+   dxJoint::Info1 info;
+ };
+ 
+-void dxQuickStepper (dxWorldProcessContext *context, 
++void dxQuickStepper (dxWorldProcessContext *shared_context,dxWorldProcessContext *context, 
+   dxWorld *world, dxBody * const *body, int nb,
+   dxJoint * const *_joint, int _nj, dReal stepsize)
+ {
+@@ -753,9 +753,9 @@
+         // format:
+         //
+         //   l1 l1 l1 a1 a1 a1 l2 l2 l2 a2 a2 a2 \    .
+-        //   l1 l1 l1 a1 a1 a1 l2 l2 l2 a2 a2 a2  }-- jacobian for joint 0, body 1 and body 2 (3 rows)
++        //   l1 l1 l1 a1 a1 a1 l2 l2 l2 a2 a2 a2  )-- jacobian for joint 0, body 1 and body 2 (3 rows)
+         //   l1 l1 l1 a1 a1 a1 l2 l2 l2 a2 a2 a2 /
+-        //   l1 l1 l1 a1 a1 a1 l2 l2 l2 a2 a2 a2 }--- jacobian for joint 1, body 1 and body 2 (3 rows)
++        //   l1 l1 l1 a1 a1 a1 l2 l2 l2 a2 a2 a2 )--- jacobian for joint 1, body 1 and body 2 (3 rows)
+         //   etc...
+         //
+         //   (lll) = linear jacobian data
+Index: ode/src/util.h
+===================================================================
+--- ode/src/util.h	(revision 1730)
++++ ode/src/util.h	(working copy)
+@@ -23,6 +23,7 @@
+ #ifndef _ODE_UTIL_H_
+ #define _ODE_UTIL_H_
+ 
++#define SIZE_MAX ((size_t)(-1))
+ #include "objects.h"
+ 
+ 
+@@ -187,8 +188,8 @@
+ 
+   void CleanupContext();
+ 
+-  void SavePreallocations(int islandcount, int const *islandsizes, dxBody *const *bodies, dxJoint *const *joints);
+-  void RetrievePreallocations(int &islandcount, int const *&islandsizes, dxBody *const *&bodies, dxJoint *const *&joints);
++  void SavePreallocations(int islandcount, int const *islandsizes, dxBody *const *bodies, dxJoint *const *joints, size_t const *islandreqs);
++  void RetrievePreallocations(int &islandcount, int const *&islandsizes, dxBody *const *&bodies, dxJoint *const *&joints, size_t const *&islandreqs);
+   void OffsetPreallocations(size_t stOffset);
+   void CopyPreallocations(const dxWorldProcessContext *othercontext);
+   void ClearPreallocations();
+@@ -204,6 +205,7 @@
+ 
+   int m_IslandCount;
+   int const *m_pIslandSizes;
++  size_t const *m_pIslandReqs;
+   dxBody *const *m_pBodies;
+   dxJoint *const *m_pJoints;
+ 
+@@ -216,7 +218,7 @@
+ #define BEGIN_STATE_SAVE(context, state) void *state = context->SaveState();
+ #define END_STATE_SAVE(context, state) context->RestoreState(state)
+ 
+-typedef void (*dstepper_fn_t) (dxWorldProcessContext *context, 
++typedef void (*dstepper_fn_t) (dxWorldProcessContext *context,dxWorldProcessContext *island_context, 
+         dxWorld *world, dxBody * const *body, int nb,
+         dxJoint * const *_joint, int _nj, dReal stepsize);
+ 
+Index: ode/src/misc.cpp
+===================================================================
+--- ode/src/misc.cpp	(revision 1730)
++++ ode/src/misc.cpp	(working copy)
+@@ -109,7 +109,17 @@
+   }
+ }
+ 
++void dPrintIntMatrix (const int *A, int n, int m, char *fmt, FILE *f)
++{
++  int skip = 1;
++  const int *Arow = A;
++  for (int i=0; i<n; Arow+=skip, ++i) {
++    for (int j=0; j<m; ++j) fprintf (f,fmt,Arow[j]);
++    fprintf (f,"\n");
++  }
++}
+ 
++
+ void dMakeRandomVector (dReal *A, int n, dReal range)
+ {
+   int i;
+Index: ode/src/quickstep.h
+===================================================================
+--- ode/src/quickstep.h	(revision 1730)
++++ ode/src/quickstep.h	(working copy)
+@@ -28,7 +28,7 @@
+ size_t dxEstimateQuickStepMemoryRequirements (
+   dxBody * const *body, int nb, dxJoint * const *_joint, int _nj);
+ 
+-void dxQuickStepper (dxWorldProcessContext *context,
++void dxQuickStepper (dxWorldProcessContext *shared_context,dxWorldProcessContext *context,
+         dxWorld *world, dxBody * const *body, int nb,
+ 		    dxJoint * const *_joint, int _nj, dReal stepsize);
+ 
+Index: ode/src/util.cpp
+===================================================================
+--- ode/src/util.cpp	(revision 1730)
++++ ode/src/util.cpp	(working copy)
+@@ -25,6 +25,8 @@
+ #include "objects.h"
+ #include "joints/joint.h"
+ #include "util.h"
++#include <boost/thread/recursive_mutex.hpp>
++#include <boost/bind.hpp>
+ 
+ static void InternalFreeWorldProcessContext (dxWorldProcessContext *context);
+ 
+@@ -45,17 +47,19 @@
+   FreePreallocationsContext();
+ }
+ 
+-void dxWorldProcessContext::SavePreallocations(int islandcount, int const *islandsizes, dxBody *const *bodies, dxJoint *const *joints)
++void dxWorldProcessContext::SavePreallocations(int islandcount, int const *islandsizes, dxBody *const *bodies, dxJoint *const *joints, size_t const *islandreqs)
+ {
+   m_IslandCount = islandcount;
++  m_pIslandReqs = islandreqs;
+   m_pIslandSizes = islandsizes;
+   m_pBodies = bodies;
+   m_pJoints = joints;
+ }
+ 
+-void dxWorldProcessContext::RetrievePreallocations(int &islandcount, int const *&islandsizes, dxBody *const *&bodies, dxJoint *const *&joints)
++void dxWorldProcessContext::RetrievePreallocations(int &islandcount, int const *&islandsizes, dxBody *const *&bodies, dxJoint *const *&joints, size_t const *&islandreqs)
+ {
+   islandcount = m_IslandCount;
++  islandreqs = m_pIslandReqs;
+   islandsizes = m_pIslandSizes;
+   bodies = m_pBodies;
+   joints = m_pJoints;
+@@ -65,6 +69,7 @@
+ {
+   // m_IslandCount = -- no offset for count
+   m_pIslandSizes = m_pIslandSizes ? (int const *)((size_t)m_pIslandSizes + stOffset) : NULL;
++  m_pIslandReqs = m_pIslandReqs ? (size_t const *)((size_t)m_pIslandReqs + stOffset) : NULL;
+   m_pBodies = m_pBodies ? (dxBody *const *)((size_t)m_pBodies + stOffset) : NULL;
+   m_pJoints = m_pJoints ? (dxJoint *const *)((size_t)m_pJoints + stOffset) : NULL;
+ }
+@@ -73,6 +78,7 @@
+ {
+   m_IslandCount = othercontext->m_IslandCount;
+   m_pIslandSizes = othercontext->m_pIslandSizes;
++  m_pIslandReqs = othercontext->m_pIslandReqs;
+   m_pBodies = othercontext->m_pBodies;
+   m_pJoints = othercontext->m_pJoints;
+ }
+@@ -81,6 +87,7 @@
+ {
+   m_IslandCount = 0;
+   m_pIslandSizes = NULL;
++  m_pIslandReqs = NULL;
+   m_pBodies = NULL;
+   m_pJoints = NULL;
+ }
+@@ -371,6 +378,8 @@
+ 
+   size_t islandcounts = dEFFICIENT_SIZE(world->nb * 2 * sizeof(int));
+   res += islandcounts;
++  size_t islandreqs = dEFFICIENT_SIZE(world->nb * sizeof(size_t));
++  res += islandreqs;
+ 
+   size_t bodiessize = dEFFICIENT_SIZE(world->nb * sizeof(dxBody*));
+   size_t jointssize = dEFFICIENT_SIZE(world->nj * sizeof(dxJoint*));
+@@ -380,6 +389,11 @@
+   return res;
+ }
+ 
++// sorts out islands,
++// cllocates array for island information into arrays: body[nj], joint[nb], islandsizes[2*nb]
++//   context->SavePreallocations(islandcount, islandsizes, body, joint,islandreqs);
++// and put into context
++//
+ static size_t BuildIslandsAndEstimateStepperMemoryRequirements(dxWorldProcessContext *context, 
+   dxWorld *world, dReal stepsize, dmemestimate_fn_t stepperestimate)
+ {
+@@ -393,33 +407,42 @@
+   // Make array for island body/joint counts
+   int *islandsizes = context->AllocateArray<int>(2 * nb);
+   int *sizescurr;
++  size_t *islandreqs = context->AllocateArray<size_t>(nb);
++  size_t *islandreqscurr;
+ 
+   // make arrays for body and joint lists (for a single island) to go into
+-  dxBody **body = context->AllocateArray<dxBody *>(nb);
+-  dxJoint **joint = context->AllocateArray<dxJoint *>(nj);
++  dxBody **body = context->AllocateArray<dxBody *>(nb);  // allocates a block of pointers and get back a pointer to first element
++  dxJoint **joint = context->AllocateArray<dxJoint *>(nj);  // allocates a block of pointers and get back a pointer to first element
+ 
+   BEGIN_STATE_SAVE(context, stackstate) {
+-    // allocate a stack of unvisited bodies in the island. the maximum size of
++    // stack is used to hold untagged bodies when traversing through all the joint-linked bodies.
++    // at the end, all the bodies in the stack are popped back out into the island.
++    //
++    // allocate a stack of UNVISITED BODIES in the island. the maximum size of
+     // the stack can be the lesser of the number of bodies or joints, because
+     // new bodies are only ever added to the stack by going through untagged
+     // joints. all the bodies in the stack must be tagged!
+     int stackalloc = (nj < nb) ? nj : nb;
+-    dxBody **stack = context->AllocateArray<dxBody *>(stackalloc);
++    dxBody **stack = context->AllocateArray<dxBody *>(stackalloc);  // a body stack
+ 
+     {
+-      // set all body/joint tags to 0
+-      for (dxBody *b=world->firstbody; b; b=(dxBody*)b->next) b->tag = 0;
+-      for (dxJoint *j=world->firstjoint; j; j=(dxJoint*)j->next) j->tag = 0;
++      // set all body/joint island_tags to 0
++      for (dxBody *b=world->firstbody; b; b=(dxBody*)b->next) b->island_tag = 0;
++      for (dxJoint *j=world->firstjoint; j; j=(dxJoint*)j->next) j->island_tag = 0;
+     }
+ 
++    int island_count = 0;
+     sizescurr = islandsizes;
++    islandreqscurr = islandreqs;
+     dxBody **bodystart = body;
+     dxJoint **jointstart = joint;
++    // loop through all body, tag each one as it is processed
++    // every step in this for loop is one island
+     for (dxBody *bb=world->firstbody; bb; bb=(dxBody*)bb->next) {
+       // get bb = the next enabled, untagged body, and tag it
+-      if (!bb->tag) {
++      if (!bb->island_tag) {
+         if (!(bb->flags & dxBodyDisabled)) {
+-          bb->tag = 1;
++          bb->island_tag = 1;
+ 
+           dxBody **bodycurr = bodystart;
+           dxJoint **jointcurr = jointstart;
+@@ -431,19 +454,19 @@
+           dxBody *b = bb;
+ 
+           while (true) {
+-            // traverse and tag all body's joints, add untagged connected bodies
++            // traverse and island_tag all body's joints, add untagged connected bodies
+             // to stack
+             for (dxJointNode *n=b->firstjoint; n; n=n->next) {
+               dxJoint *njoint = n->joint;
+-              if (!njoint->tag) {
++              if (!njoint->island_tag) {
+                 if (njoint->isEnabled()) {
+-                  njoint->tag = 1;
++                  njoint->island_tag = 1;
+                   *jointcurr++ = njoint;
+ 
+                   dxBody *nbody = n->body;
+                   // Body disabled flag is not checked here. This is how auto-enable works.
+-                  if (nbody && nbody->tag <= 0) {
+-                    nbody->tag = 1;
++                  if (nbody && nbody->island_tag <= 0) {
++                    nbody->island_tag = 1;
+                     // Make sure all bodies are in the enabled state.
+                     nbody->flags &= ~dxBodyDisabled;
+                     stack[stacksize++] = nbody;
+@@ -470,17 +493,19 @@
+           sizescurr[1] = jcount;
+           sizescurr += sizeelements;
+ 
+-          size_t islandreq = stepperestimate(bodystart, bcount, jointstart, jcount);
+-          maxreq = (maxreq > islandreq) ? maxreq : islandreq;
++          *islandreqscurr = stepperestimate(bodystart, bcount, jointstart, jcount);
++          maxreq = (maxreq > *islandreqscurr) ? maxreq : *islandreqscurr;
++          //printf("island %d complete, stepper  %d maxreq %d \n",island_count++,*islandreqscurr, maxreq);
++          islandreqscurr += 1;
+ 
+           bodystart = bodycurr;
+           jointstart = jointcurr;
+         } else {
+-          bb->tag = -1; // Not used so far (assigned to retain consistency with joints)
++          bb->island_tag = -1; // Not used so far (assigned to retain consistency with joints)
+         }
+       }
+     }
+-  } END_STATE_SAVE(context, stackstate);
++  } END_STATE_SAVE(context, stackstate);  // restores contex pointer m_pAllocCurrent back to what it was before this block
+ 
+ # ifndef dNODEBUG
+   // if debugging, check that all objects (except for disabled bodies,
+@@ -489,10 +514,10 @@
+   {
+     for (dxBody *b=world->firstbody; b; b=(dxBody*)b->next) {
+       if (b->flags & dxBodyDisabled) {
+-        if (b->tag > 0) dDebug (0,"disabled body tagged");
++        if (b->island_tag > 0) dDebug (0,"disabled body tagged");
+       }
+       else {
+-        if (b->tag <= 0) dDebug (0,"enabled body not tagged");
++        if (b->island_tag <= 0) dDebug (0,"enabled body not tagged");
+       }
+     }
+     for (dxJoint *j=world->firstjoint; j; j=(dxJoint*)j->next) {
+@@ -500,18 +525,24 @@
+         (j->node[1].body && (j->node[1].body->flags & dxBodyDisabled)==0) )
+         && 
+         j->isEnabled() ) {
+-          if (j->tag <= 0) dDebug (0,"attached enabled joint not tagged");
++          if (j->island_tag <= 0) dDebug (0,"attached enabled joint not tagged");
+       }
+       else {
+-        if (j->tag > 0) dDebug (0,"unattached or disabled joint tagged");
++        if (j->island_tag > 0) dDebug (0,"unattached or disabled joint tagged");
+       }
+     }
+   }
+ # endif
+ 
+   int islandcount = (sizescurr - islandsizes) / sizeelements;
+-  context->SavePreallocations(islandcount, islandsizes, body, joint);
++  context->SavePreallocations(islandcount, islandsizes, body, joint,islandreqs);
+ 
++  //printf("total island count: %d\n",islandcount);
++  for (int j=0; j<islandcount; j++)
++  {
++    //printf("island:%d bodycount:%d jointcount:%d islandreqs:%d \n",j,islandsizes[2*j],islandsizes[2*j+1],islandreqs[j]);
++  }
++
+   return maxreq;
+ }
+ 
+@@ -526,6 +557,20 @@
+ // bodies will not be included in the simulation. disabled bodies are
+ // re-enabled if they are found to be part of an active island.
+ 
++void dxProcessOneIsland(dxWorldProcessContext *context,dxWorldProcessContext *island_context, dxWorld *world, dReal stepsize, dstepper_fn_t stepper,
++                        dxBody *const* bodystart,
++                        int bcount,
++                        dxJoint *const *jointstart,
++                        int jcount)
++{
++    dAllocateODEDataForThread(dAllocateMaskAll);
++
++    BEGIN_STATE_SAVE(island_context, island_stepperstate) {
++      stepper (context,island_context,world,bodystart,bcount,jointstart,jcount,stepsize);
++    } END_STATE_SAVE(island_context, island_stepperstate);
++    dCleanupODEAllDataForThread();
++}
++
+ void dxProcessIslands (dxWorld *world, dReal stepsize, dstepper_fn_t stepper)
+ {
+   const int sizeelements = 2;
+@@ -536,28 +581,43 @@
+   dxWorldProcessContext *context = wmem->GetWorldProcessingContext(); 
+ 
+   int islandcount;
++  size_t const *islandreqs;
+   int const *islandsizes;
+   dxBody *const *body;
+   dxJoint *const *joint;
+-  context->RetrievePreallocations(islandcount, islandsizes, body, joint);
++  context->RetrievePreallocations(islandcount, islandsizes, body, joint, islandreqs);
+ 
+   dxBody *const *bodystart = body;
+   dxJoint *const *jointstart = joint;
+ 
++  int island_index = 0;
+   int const *const sizesend = islandsizes + islandcount * sizeelements;
+   for (int const *sizescurr = islandsizes; sizescurr != sizesend; sizescurr += sizeelements) {
+     int bcount = sizescurr[0];
+     int jcount = sizescurr[1];
+ 
+-    BEGIN_STATE_SAVE(context, stepperstate) {
+-      // now do something with body and joint lists
+-      stepper (context,world,bodystart,bcount,jointstart,jcount,stepsize);
+-    } END_STATE_SAVE(context, stepperstate);
++    //printf("debug: islandcount %d bcount %d jcount %d \n", islandcount,bcount, jcount);
+ 
++    dxStepWorkingMemory *island_wmem = world->island_wmems[island_index];
++    island_index++;
++    dIASSERT(island_wmem != NULL);
++    dxWorldProcessContext *island_context = island_wmem->GetWorldProcessingContext();
++
++#define TPOOLISLAND
++#ifdef TPOOLISLAND
++    world->threadpool->schedule(boost::bind(dxProcessOneIsland,context,island_context, world, stepsize, stepper,bodystart, bcount, jointstart, jcount));
++#else
++    dxProcessOneIsland(context,island_context, world, stepsize, stepper,bodystart, bcount, jointstart, jcount);
++#endif
++
+     bodystart += bcount;
+     jointstart += jcount;
+   }
++  world->threadpool->wait();
+ 
++  for (int jj=0; jj < islandcount; jj++)
++    world->island_wmems[jj]->GetWorldProcessingContext()->CleanupContext();
++
+   context->CleanupContext();
+   dIASSERT(context->IsStructureValid());
+ }
+@@ -713,7 +773,7 @@
+ bool dxReallocateWorldProcessContext (dxWorld *world, 
+   dReal stepsize, dmemestimate_fn_t stepperestimate)
+ {
+-  dxStepWorkingMemory *wmem = AllocateOnDemand(world->wmem);
++  dxStepWorkingMemory *wmem = AllocateOnDemand(world->wmem);  // this is starting a new instance of dxStepWorkingMemory
+   if (!wmem) return false;
+ 
+   dxWorldProcessContext *oldcontext = wmem->GetWorldProcessingContext();
+@@ -724,6 +784,10 @@
+ 
+   dxWorldProcessContext *context = oldcontext;
+ 
++  // EstimateIslandsProcessingMemoryRequirements allocates memeory for 3 arrays:
++  //    islandsizes: integer arrays, 2*n_islands in size, contains bodycount and jointcount for each island
++  //    body: one array with all the 'active' bodies, all indexed by islandsizes
++  //    joint: one array with all the 'active' joints, all indexed by islandsizes
+   size_t sesize;
+   size_t islandsreq = EstimateIslandsProcessingMemoryRequirements(world, sesize);
+   dIASSERT(islandsreq == dEFFICIENT_SIZE(islandsreq));
+@@ -732,16 +796,45 @@
+   size_t stepperestimatereq = islandsreq + sesize;
+   context = InternalReallocateWorldProcessContext(context, stepperestimatereq, memmgr, 1.0f, reserveinfo->m_uiReserveMinimum);
+   
++  //
++  // above context allocation of the island arrays is successful, then we proceed to allocate more spaces for the actual stepping work
++  //
++  // we want to start multiple contexts, one for each island.
++  //
+   if (context)
+   {
+     size_t stepperreq = BuildIslandsAndEstimateStepperMemoryRequirements(context, world, stepsize, stepperestimate);
+     dIASSERT(stepperreq == dEFFICIENT_SIZE(stepperreq));
+ 
+-    size_t memreq = stepperreq + islandsreq;
+-    context = InternalReallocateWorldProcessContext(context, memreq, memmgr, reserveinfo->m_fReserveFactor, reserveinfo->m_uiReserveMinimum);
++    // retrieve results of BuildIslandsAndEstimateStepperMemoryRequirements
++    int islandcount;
++    size_t const *islandreqs;
++    int const *islandsizes;
++    dxBody *const *body;
++    dxJoint *const *joint;
++    context->RetrievePreallocations(islandcount, islandsizes, body, joint, islandreqs);
++
++    for (int jj = 0; jj < islandcount; jj++)
++    {
++      // for individual islands
++      dxStepWorkingMemory *island_wmem = AllocateOnDemand(world->island_wmems[jj]);  // this is starting a new instance of dxStepWorkingMemory
++      if (!island_wmem) return false;
++
++      dxWorldProcessContext *island_oldcontext = island_wmem->GetWorldProcessingContext();
++      dIASSERT (!island_oldcontext || island_oldcontext->IsStructureValid());
++
++      const dxWorldProcessMemoryReserveInfo *island_reserveinfo = island_wmem->SureGetMemoryReserveInfo();
++      const dxWorldProcessMemoryManager *island_memmgr = island_wmem->SureGetMemoryManager();
++
++      dxWorldProcessContext *island_context = island_oldcontext;
++
++      size_t island_memreq = islandreqs[jj]; //  + islandsreq;
++      island_context = InternalReallocateWorldProcessContext(island_context, island_memreq, island_memmgr, island_reserveinfo->m_fReserveFactor, island_reserveinfo->m_uiReserveMinimum);
++      island_wmem->SetWorldProcessingContext(island_context); // set dxStepWorkingMemory to context
++    }
+   }
+ 
+-  wmem->SetWorldProcessingContext(context);
++  wmem->SetWorldProcessingContext(context); // set dxStepWorkingMemory to context
+   return context != NULL;
+ }
+ 
+Index: ode/src/step.h
+===================================================================
+--- ode/src/step.h	(revision 1730)
++++ ode/src/step.h	(working copy)
+@@ -28,7 +28,7 @@
+ size_t dxEstimateStepMemoryRequirements (
+   dxBody * const *body, int nb, dxJoint * const *_joint, int _nj);
+ 
+-void dInternalStepIsland (dxWorldProcessContext *context, dxWorld *world,
++void dInternalStepIsland (dxWorldProcessContext *shared_context,dxWorldProcessContext *context, dxWorld *world,
+ 			  dxBody * const *body, int nb,
+ 			  dxJoint * const *joint, int nj,
+ 			  dReal stepsize);
+Index: ode/src/objects.h
+===================================================================
+--- ode/src/objects.h	(revision 1730)
++++ ode/src/objects.h	(working copy)
+@@ -30,6 +30,7 @@
+ #include <ode/memory.h>
+ #include <ode/mass.h>
+ #include "array.h"
++#include <boost/threadpool.hpp>
+ 
+ class dxStepWorkingMemory;
+ 
+@@ -66,6 +67,7 @@
+   dObject *next;		// next object of this type in list
+   dObject **tome;		// pointer to previous object's next ptr
+   int tag;			// used by dynamics algorithms
++  int island_tag;		// used by island algorithms for grouping
+   void *userdata;		// user settable data
+   dObject(dxWorld *w);
+   virtual ~dObject() { }
+@@ -151,11 +153,13 @@
+   dxAutoDisable adis;		// auto-disable parameters
+   int body_flags;               // flags for new bodies
+   dxStepWorkingMemory *wmem; // Working memory object for dWorldStep/dWorldQuickStep
++  dxStepWorkingMemory *island_wmems[1000]; // Working memory object for dWorldStep/dWorldQuickStep
+ 
+   dxQuickStepParameters qs;
+   dxContactParameters contactp;
+   dxDampingParameters dampingp; // damping parameters
+   dReal max_angular_speed;      // limit the angular velocity to this magnitude
++  boost::threadpool::pool *threadpool;
+ };
+ 
+ 
+Index: ode/src/collision_kernel.h
+===================================================================
+--- ode/src/collision_kernel.h	(revision 1730)
++++ ode/src/collision_kernel.h	(working copy)
+@@ -34,6 +34,7 @@
+ #include <ode/collision.h>
+ #include "objects.h"
+ #include "odetls.h"
++#include <boost/thread/mutex.hpp>
+ 
+ //****************************************************************************
+ // constants and macros
+@@ -204,6 +205,8 @@
+   int sublevel;         // space sublevel (used in dSpaceCollide2). NOT TRACKED AUTOMATICALLY!!!
+   unsigned tls_kind;	// space TLS kind to be used for global caches retrieval
+ 
++  boost::mutex mutex;
++
+   // cached state for getGeom()
+   int current_index;		// only valid if current_geom != 0
+   dxGeom *current_geom;		// if 0 then there is no information
+Index: ode/src/ode.cpp
+===================================================================
+--- ode/src/ode.cpp	(revision 1730)
++++ ode/src/ode.cpp	(working copy)
+@@ -1559,6 +1559,10 @@
+   w->body_flags = 0; // everything disabled
+ 
+   w->wmem = 0;
++  for (int jj=0; jj < 1000; jj++)
++  {
++    w->island_wmems[jj] = 0;
++  }
+ 
+   w->adis.idle_steps = 10;
+   w->adis.idle_time = 0;
+@@ -1578,6 +1582,8 @@
+   w->dampingp.angular_threshold = REAL(0.01) * REAL(0.01);  
+   w->max_angular_speed = dInfinity;
+ 
++  w->threadpool = new boost::threadpool::pool(4);
++
+   return w;
+ }
+ 
+@@ -1617,6 +1623,8 @@
+     w->wmem->Release();
+   }
+ 
++  delete w->threadpool;
++
+   delete w;
+ }
+ 
+Index: ode/src/step.cpp
+===================================================================
+--- ode/src/step.cpp	(revision 1730)
++++ ode/src/step.cpp	(working copy)
+@@ -838,8 +838,7 @@
+ }
+ 
+ //****************************************************************************
+-
+-void dInternalStepIsland (dxWorldProcessContext *context, 
++void dInternalStepIsland (dxWorldProcessContext *shared_context, dxWorldProcessContext *context, 
+                           dxWorld *world, dxBody * const *body, int nb,
+                           dxJoint * const *joint, int nj, dReal stepsize)
+ {

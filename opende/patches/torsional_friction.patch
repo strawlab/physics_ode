@@ -1,0 +1,56 @@
+Index: include/ode/contact.h
+===================================================================
+--- include/ode/contact.h	(revision 1706)
++++ include/ode/contact.h	(working copy)
+@@ -45,7 +45,8 @@
+   dContactApprox0	= 0x0000,
+   dContactApprox1_1	= 0x1000,
+   dContactApprox1_2	= 0x2000,
+-  dContactApprox1	= 0x3000
++  dContactApprox1	= 0x3000,
++  dContactTorsionApprox1= 0x4000    // toggle decoupled torsional friction approximation
+ };
+ 
+ 
+@@ -56,6 +57,7 @@
+ 
+   /* only defined if the corresponding flag is set in mode */
+   dReal mu2;
++  dReal mu3;
+   dReal bounce;
+   dReal bounce_vel;
+   dReal soft_erp;
+Index: ode/src/joints/contact.cpp
+===================================================================
+--- ode/src/joints/contact.cpp	(revision 1706)
++++ ode/src/joints/contact.cpp	(working copy)
+@@ -61,6 +61,13 @@
+     {
+         if ( contact.surface.mu > 0 ) m += 2;
+         if ( contact.surface.mu == dInfinity ) nub += 2;
++
++        // add torsional friction
++        if ( contact.surface.mode & dContactTorsionApprox1 )
++        {
++          if ( contact.surface.mu > 0 ) m ++;
++          if ( contact.surface.mu == dInfinity ) nub ++;
++        }
+     }
+ 
+     the_m = m;
+@@ -251,6 +258,15 @@
+         if ( contact.surface.mode & dContactSlip2 )
+             info->cfm[2] = contact.surface.slip2;
+     }
++
++    // torsional friction direction
++    if ( the_m >= 4 )
++    {
++        info->J1a[s2+0] = normal[0];
++        info->J1a[s2+1] = normal[1];
++        info->J1a[s2+2] = normal[2];
++        dCROSS( info->J1a + s2, = , c1, t2 );
++    }
+ }
+ 
+ dJointType
