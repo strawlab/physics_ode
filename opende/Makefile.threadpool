@@ -1,6 +1,6 @@
 all: threadpool_installed
 TARBALL = build/threadpool-0_2_5-src.zip
-TARBALL_URL = http://pr.willowgarage.com/downloads/threadpool-0_2_5-src.zip
+TARBALL_URL = http://static.strawlab.org/downloads/threadpool-0_2_5-src.zip
 SOURCE_DIR = build/threadpool
 INITIAL_DIR = build/threadpool-0_2_5-src/threadpool
 UNPACK_CMD = unzip

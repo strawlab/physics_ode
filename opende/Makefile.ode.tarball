@@ -19,7 +19,7 @@ ROOT = $(shell rospack find opende)/opende
 
 FILENAME = opende-wg-branch-r1825.tar.gz
 TARBALL = build/$(FILENAME)
-TARBALL_URL = http://pr.willowgarage.com/downloads/$(FILENAME)
+TARBALL_URL = http://static.strawlab.org/downloads/$(FILENAME)
 #TARBALL_PATCH = patches/quickstep_tprow.patch
 INITIAL_DIR = build/opende-wg-branch-r1825
 SOURCE_DIR = build/opende
